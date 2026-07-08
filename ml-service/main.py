@@ -1,6 +1,6 @@
 import asyncio
 import random
-from datetime import date 
+from datetime import date, datetime
 import numpy as np
 from pydantic import BaseModel
 from typing import List
@@ -160,4 +160,52 @@ def calculate_payoff(req: PayoffRequest):
         "breakevens": breakevens,
         "max_profit": max_profit if max_profit < 1e6 else "unlimited",
         "max_loss": max_loss if max_loss > -1e6 else "unlimited",
-    }        
+    } 
+
+# ---------------- Step 8: Margin Estimator ----------------
+
+class MarginRequest(BaseModel):
+    legs: List[OptionLeg]
+    current_spot: float
+
+
+@app.post("/api/margin")
+def calculate_margin(req: MarginRequest):
+    # Use a wide spot range to reliably detect unbounded risk at the tails
+    spot_range_pct = 0.5
+    steps = 200
+    low = req.current_spot * (1 - spot_range_pct)
+    high = req.current_spot * (1 + spot_range_pct)
+    spot_prices = np.linspace(low, high, steps)
+
+    total_payoff = np.zeros(steps)
+    for leg in req.legs:
+        total_payoff += leg_payoff(leg, spot_prices)
+
+    max_loss = float(np.min(total_payoff))
+
+    # If payoff is still worsening at either boundary, risk is unbounded
+    slope_low = total_payoff[1] - total_payoff[0]
+    slope_high = total_payoff[-1] - total_payoff[-2]
+    is_defined_risk = not (slope_low > 0 or slope_high < 0)
+
+    if is_defined_risk:
+        margin_required = abs(max_loss)
+        method = "max_loss"
+    else:
+        margin_required = 0.0
+        for leg in req.legs:
+            if leg.position == "sell":
+                span = 0.15 * req.current_spot * leg.quantity
+                exposure = 0.03 * req.current_spot * leg.quantity
+                leg_margin = span + exposure - (leg.premium * leg.quantity)
+                floor = 0.05 * req.current_spot * leg.quantity
+                margin_required += max(leg_margin, floor)
+        method = "span_approx"
+
+    return {
+        "margin_required": round(margin_required, 2),
+        "method": method,
+        "is_defined_risk": is_defined_risk,
+        "max_loss": max_loss if is_defined_risk else "unlimited",
+    }       
