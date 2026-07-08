@@ -31,45 +31,45 @@ graph TD
 
     subgraph "Spring Boot Backend :8080"
         RC[RiskProfileController]
-        PC[PayoffController]
-        MC[MarginController]
-        SC[StrategyController]
+        SC[StrategySaveController]
+        REC[StrategyController]
         MDP[MarketDataProducer]
         MDC[MarketDataConsumer]
     end
 
     subgraph "FastAPI ML Service :8000"
-        REC[POST /api/recommend]
+        FREC[POST /api/recommend]
         PAY[POST /api/payoff]
         MAR[POST /api/margin]
         WS[WS /ws/options-chain/symbol]
     end
 
-    DB[(PostgreSQL 5432<br/>strategybuilder)]
-    RD[(Redis<br/>chain:NIFTY)]
-    KF[(Kafka 9092<br/>topic: market.ticks)]
+    DB[(PostgreSQL 5432\nstrategybuilder)]
+    RD[(Redis\nchain:NIFTY)]
+    KF[(Kafka 9092\ntopic: market.ticks)]
 
     FE -->|REST| RC
-    FE -->|REST| PC
-    FE -->|REST| MC
     FE -->|REST| SC
+    FE -->|REST| REC
     FE -.->|WebSocket| WS
 
     RC -->|JPA| DB
-    PC -->|RestTemplate POST| PAY
-    MC -->|RestTemplate POST| MAR
-    SC -->|RestTemplate POST| REC
+    SC -->|JDBC| DB
+    REC -->|RestClient POST| FREC
+    REC -->|RestClient POST| PAY
+    REC -->|RestClient POST| MAR
 
     MDP -->|produce ticks| KF
     KF -->|consume| MDC
     MDC -->|flush snapshot| RD
+    MDC -->|INSERT| DB
 ```
 
-**Two services work together:**
-1. **Spring Boot backend** — owns persistence (risk profiles in Postgres via Flyway-migrated schema), exposes REST APIs, and proxies compute-heavy requests (payoff, margin, recommendation) to the Python ML service via `RestTemplate`.
-2. **FastAPI ML service** — stateless numeric engine (numpy-based) for payoff curves, margin estimation, strategy recommendation, and a simulated live options-chain WebSocket feed.
+**Three components working together:**
 
-A separate real-time pipeline (Kafka → Redis) simulates live market ticks independently of the ML service, feeding a `chain:{SYMBOL}` snapshot into Redis every few seconds.
+1. **Spring Boot backend (:8080)** — owns all persistence via Flyway-migrated PostgreSQL schema, exposes REST APIs, proxies payoff/margin/recommendation compute to the Python ML service via `RestClient`.
+2. **FastAPI ML service (:8000)** — stateless numeric engine for payoff curves, margin estimation, strategy recommendation, and a simulated live options-chain WebSocket feed.
+3. **Kafka → Redis pipeline** — `MarketDataProducer` simulates live option ticks every 3 seconds using Black-Scholes math, publishes to Kafka topic `market.ticks`, `MarketDataConsumer` fans out to Redis (hot cache for instant reads) and TimescaleDB hypertable (historical tick storage).
 
 ---
 
@@ -77,112 +77,131 @@ A separate real-time pipeline (Kafka → Redis) simulates live market ticks inde
 
 | Layer | Technology |
 |---|---|
-| Backend | Java 17+, Spring Boot 4.1.0, Spring Data JPA, Spring Data Redis, Spring Security (dev-mode, unauthenticated) |
-| ML Service | Python, FastAPI, NumPy, Pydantic |
-| Database | PostgreSQL 16 |
-| Migrations | Flyway |
-| Cache / Snapshot store | Redis |
-| Streaming | Apache Kafka (topic: `market.ticks`) |
-| Build tool | Maven |
+| Backend | Java 25, Spring Boot 4.1.0, Spring Data JPA, Spring Data Redis, Spring Kafka, Spring Security (dev-mode) |
+| ML / Compute service | Python, FastAPI, NumPy, Pydantic, Uvicorn |
+| Database | PostgreSQL 16 via TimescaleDB (hypertable for tick data) |
+| Schema migrations | Flyway 12 (5 versioned migrations, explicit Bean wiring) |
+| Cache | Redis 7 — `chain:NIFTY` key, 30-second TTL |
+| Event streaming | Apache Kafka 4.2 (KRaft mode, no Zookeeper) |
+| Build | Maven, Docker Compose |
 
 ---
 
 ## Project Structure
+
+```
 strategy-builder/
-├── backend/                                # Spring Boot service
+├── backend/
 │   ├── src/main/java/com/moneylogix/strategybuilder/
 │   │   ├── StrategyBuilderBackendApplication.java
+│   │   ├── common/
+│   │   │   ├── SecurityConfig.java         # Spring Security disabled for dev
+│   │   │   └── MlClientConfig.java         # RestClient bean → ML service
 │   │   ├── riskprofile/
-│   │   │   ├── RiskProfile.java            # JPA entity
-│   │   │   ├── RiskProfileController.java
-│   │   │   ├── RiskProfileRepository.java
-│   │   │   ├── RiskProfileRequestDto.java
-│   │   │   ├── RiskProfileResponseDto.java
-│   │   │   └── RiskProfileService.java
+│   │   │   ├── RiskProfile.java            # JPA entity (@Entity, UUID PK)
+│   │   │   ├── RiskBand.java               # enum CONSERVATIVE/MODERATE/AGGRESSIVE
+│   │   │   ├── RiskProfileController.java  # POST /api/risk-profile, GET /api/risk-profile/me
+│   │   │   ├── RiskProfileRepository.java  # JPA repo, findTopByUserIdOrderByCreatedAtDesc
+│   │   │   ├── RiskProfileRequest.java
+│   │   │   ├── RiskProfileResponse.java
+│   │   │   └── RiskProfileService.java     # weighted scoring engine
 │   │   ├── strategy/
-│   │   │   ├── OptionLegDto.java
-│   │   │   ├── PayoffRequestDto.java
-│   │   │   ├── PayoffResponseDto.java
-│   │   │   ├── PayoffController.java
-│   │   │   ├── MarginRequestDto.java
-│   │   │   ├── MarginResponseDto.java
-│   │   │   ├── MarginController.java
-│   │   │   └── StrategyController.java     # /api/strategy/recommend
+│   │   │   ├── StrategyController.java     # GET /api/strategy/recommend
+│   │   │   ├── StrategySaveController.java # POST /api/strategy/save, GET /api/strategy/my-strategies
+│   │   │   └── StrategySaveRequest.java
 │   │   └── marketdata/
-│   │       ├── MarketDataProducer.java     # publishes ticks to Kafka
-│   │       └── MarketDataConsumer.java     # flushes chain snapshot to Redis
+│   │       ├── KafkaConfig.java            # @EnableKafka, ProducerFactory, ConsumerFactory
+│   │       ├── MarketDataProvider.java     # interface (adapter pattern)
+│   │       ├── MockMarketDataProvider.java # Black-Scholes tick generator
+│   │       ├── MarketDataProducer.java     # @Scheduled every 3s → Kafka
+│   │       ├── MarketDataConsumer.java     # @KafkaListener → Redis + TimescaleDB
+│   │       └── OptionTick.java             # DTO
 │   ├── src/main/resources/
 │   │   ├── application.yml
-│   │   └── db/migration/                   # Flyway SQL scripts (V1__..V6__)
+│   │   └── db/migration/
+│   │       ├── V1__create_core_tables.sql
+│   │       ├── V2__create_recommendations.sql
+│   │       ├── V3__create_strategies.sql
+│   │       ├── V4__create_market_ticks_hypertable.sql
+│   │       └── V5__add_retention_policy.sql
 │   └── pom.xml
-│
-└── ml-service/                             # FastAPI service
-└── main.py                             # recommend, payoff, margin, options-chain WS
+├── ml-service/
+│   └── main.py                             # recommend, payoff, margin, WS endpoints
+├── docker-compose.yml                      # Postgres/Timescale, Redis, Kafka (KRaft)
+└── README.md
+```
+
 ---
 
 ## Prerequisites
 
-Install and have running locally:
-
-- **Java 17+** and **Maven**
-- **Python 3.10+** with `pip`
-- **PostgreSQL 16** — database `strategybuilder` created
-- **Redis** — running on default port 6379
-- **Kafka** — running on `localhost:9092` with topic `market.ticks` (auto-created if `allow.auto.create.topics=true`)
-- **Docker** (optional, if running Postgres/Redis/Kafka as containers)
+- **Java 17+** (tested on Java 25)
+- **Maven** (bundled via `mvnw.cmd`)
+- **Python 3.10+** with pip
+- **Docker Desktop** — runs Postgres/TimescaleDB, Redis, Kafka as containers
 
 ---
 
 ## Setup & Run
 
-### 1. Start infrastructure (Postgres, Redis, Kafka)
+### 1. Start Docker Desktop, then bring up infrastructure
 
-If using Docker for these, start them first and confirm they're reachable on their default ports. If disk space runs low, clean up unused Docker data:
+```cmd
+cd C:\path\to\strategy-builder
+docker compose up -d
+docker compose ps
+```
 
-```powershell
+All three containers should show `Up`: `sb-postgres`, `sb-redis`, `sb-kafka`.
+
+If disk space is low, clean up unused Docker data first:
+
+```cmd
 docker system prune -f
 docker volume prune -f
 ```
 
-### 2. Start the ML service (FastAPI)
+### 2. Start the ML service
 
 ```cmd
 cd ml-service
-pip install fastapi uvicorn numpy pydantic --break-system-packages
-uvicorn main:app --reload --port 8000
+pip install fastapi uvicorn numpy pydantic
+python -m uvicorn main:app --port 8000
 ```
 
-Verify it's up:
+Verify:
+
 ```cmd
 curl http://localhost:8000/health
 ```
+
 Expected: `{"status":"ok"}`
 
-> **Note:** run with `--reload` during development — without it, `main.py` changes won't take effect until you manually restart uvicorn.
-
-### 3. Start the backend (Spring Boot)
+### 3. Start the Spring Boot backend
 
 ```cmd
 cd backend
+set MAVEN_OPTS=-Xmx512m
 mvn spring-boot:run
 ```
 
-If you've edited Java source and the app doesn't pick up changes, force a clean rebuild:
+Watch for these lines confirming everything is wired:
+
+```
+Started StrategyBuilderBackendApplication
+Published 18 ticks for NIFTY
+Flushed chain snapshot to Redis: chain:NIFTY
+```
+
+Flyway runs all 5 migrations automatically on first startup. On subsequent startups it validates and skips.
+
+### 4. Re-seed the demo risk profile after a fresh start
+
+The database persists across Docker restarts via a named volume, but if the volume was recreated, re-run:
+
 ```cmd
-mvn clean spring-boot:run
+curl -X POST http://localhost:8080/api/risk-profile -H "Content-Type: application/json" -d "{\"answers\":{\"loss_tolerance\":2,\"drawdown_reaction\":2,\"investment_horizon\":3,\"income_stability\":3,\"prior_experience\":2,\"goal\":2}}"
 ```
-
-Watch the log for `Started StrategyBuilderBackendApplication` — that means Tomcat (port 8080), Postgres, Flyway migrations, Kafka producer/consumer, and Redis are all wired up successfully.
-
-### 4. Confirm `application.yml` has the ML service URL
-
-```yaml
-ml:
-  service:
-    url: http://localhost:8000
-```
-
-Both `PayoffController` and `MarginController` read this via `@Value("${ml.service.url:http://localhost:8000}")` — the fallback after the colon means the app won't crash even if this property is momentarily missing, though it should always be set explicitly.
 
 ---
 
@@ -190,7 +209,7 @@ Both `PayoffController` and `MarginController` read this via `@Value("${ml.servi
 
 ### Risk Profile
 
-**POST** `/api/risk-profile` — submit quiz answers, get a scored risk band back.
+**POST** `/api/risk-profile` — submit 6-question quiz answers, returns scored risk band.
 
 ```cmd
 curl -X POST http://localhost:8080/api/risk-profile ^
@@ -199,13 +218,25 @@ curl -X POST http://localhost:8080/api/risk-profile ^
 ```
 
 Response:
+
 ```json
-{"id":"...","userId":"...","riskBand":"MODERATE","score":28,"createdAt":"..."}
+{"id":"...","userId":"11111111-1111-1111-1111-111111111111","riskBand":"MODERATE","score":28,"createdAt":"..."}
 ```
 
-Bands: `CONSERVATIVE` (score 0–20), `MODERATE` (21–36), `AGGRESSIVE` (37+) — adjust thresholds in `RiskProfileService` if scoring weights change.
+**Weighted scoring logic** (in `RiskProfileService.calculateScore`):
 
-**GET** `/api/risk-profile/me` — fetch the most recent saved profile.
+| Question | Weight | Rationale |
+|---|---|---|
+| loss_tolerance | 3 | Strongest predictor of real trading behaviour under stress |
+| drawdown_reaction | 3 | Reveals panic-selling tendency |
+| investment_horizon | 2 | Affects which strategies are viable |
+| income_stability | 2 | Determines capital availability |
+| prior_experience | 1 | Informational only |
+| goal | 1 | Informational only |
+
+Max score = 48. Bands: CONSERVATIVE (0–20), MODERATE (21–36), AGGRESSIVE (37–48).
+
+**GET** `/api/risk-profile/me` — returns most recent saved profile for demo user.
 
 ```cmd
 curl http://localhost:8080/api/risk-profile/me
@@ -215,24 +246,25 @@ curl http://localhost:8080/api/risk-profile/me
 
 ### Strategy Recommendation
 
-**POST** `/api/strategy/recommend` — proxies to ML service, maps risk band → strategy.
+**GET** `/api/strategy/recommend` — looks up saved risk profile, calls ML service, returns recommended strategy.
 
 ```cmd
 curl http://localhost:8080/api/strategy/recommend
 ```
 
-Mapping (see `STRATEGY_MAP` in `main.py`):
-| Risk Band | Strategy |
-|---|---|
-| CONSERVATIVE | Covered Call |
-| MODERATE | Iron Condor |
-| AGGRESSIVE | Long Straddle |
+Risk band → strategy mapping (in `ml-service/main.py`):
+
+| Risk Band | Strategy | Rationale |
+|---|---|---|
+| CONSERVATIVE | Covered Call | Defined risk, income-generating, suits low-volatility preference |
+| MODERATE | Iron Condor | Defined risk on both sides, profits in range-bound markets |
+| AGGRESSIVE | Long Straddle | Profits from large moves either direction, unlimited upside |
 
 ---
 
 ### Payoff Diagram
 
-**POST** `/api/strategy/payoff` — given option legs and current spot, returns the full payoff curve, breakeven points, max profit, and max loss.
+**POST** `/api/strategy/payoff` — computes payoff curve, breakeven(s), max profit and max loss for any multi-leg strategy.
 
 ```cmd
 curl -X POST http://localhost:8080/api/strategy/payoff ^
@@ -240,35 +272,25 @@ curl -X POST http://localhost:8080/api/strategy/payoff ^
   -d "{\"legs\":[{\"option_type\":\"call\",\"position\":\"sell\",\"strike\":24900,\"premium\":45,\"quantity\":1},{\"option_type\":\"call\",\"position\":\"buy\",\"strike\":25000,\"premium\":20,\"quantity\":1}],\"current_spot\":24800}"
 ```
 
-Response (bear call credit spread example):
+Response:
+
 ```json
 {
   "breakevens": [24924.75],
   "max_profit": 25.0,
   "max_loss": -75.0,
-  "spot_prices": [...],
-  "payoff": [...]
+  "spot_prices": [22320.0, "...", 27280.0],
+  "payoff": [-75.0, "...", 25.0]
 }
 ```
 
-Request fields:
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `legs` | array of leg objects | — | see leg shape below |
-| `current_spot` | number | — | required |
-| `spot_range_pct` | number | 0.1 | ± range around spot to plot |
-| `steps` | int | 100 | resolution of the payoff curve |
-
-Leg shape:
-```json
-{"option_type": "call|put", "position": "buy|sell", "strike": 24900, "premium": 45, "quantity": 1}
-```
+Leg shape: `{"option_type": "call|put", "position": "buy|sell", "strike": 24900, "premium": 45, "quantity": 1}`
 
 ---
 
 ### Margin Estimator
 
-**POST** `/api/strategy/margin` — estimates margin required for a leg combination.
+**POST** `/api/strategy/margin` — estimates required margin using defined-risk detection.
 
 ```cmd
 curl -X POST http://localhost:8080/api/strategy/margin ^
@@ -277,79 +299,99 @@ curl -X POST http://localhost:8080/api/strategy/margin ^
 ```
 
 Response:
+
 ```json
 {"is_defined_risk":true,"margin_required":75.0,"max_loss":-75.0,"method":"max_loss"}
 ```
 
-**Methodology** (approximation — not a real SPAN margin engine, which requires exchange risk-parameter files not available outside a broker):
-- **Defined-risk strategies** (spreads, iron condors, any position with a capped max loss): `margin_required = abs(max_loss)`. This mirrors how spread margin is calculated in practice.
-- **Undefined-risk strategies** (naked short call/put, uncovered legs): per short leg, `margin = (15% of notional) + (3% of notional) − premium collected`, floored at 5% of notional. This is the standard retail-broker heuristic (SPAN + exposure margin, minus credit received).
-
-Risk type is auto-detected by checking whether the payoff curve keeps worsening at the far edges of a wide spot-price range (±50%) — if it does, risk is unbounded.
+**Methodology (approximation — not real SPAN):**
+- Defined-risk positions (spreads, condors): `margin = abs(max_loss)` — mirrors actual exchange treatment of spread margin.
+- Undefined-risk (naked shorts): `margin = (15% + 3%) × notional − premium collected`, floored at 5% of notional. Standard retail-broker heuristic.
+- Risk type auto-detected by checking if payoff keeps worsening at ±50% spot range edges.
 
 ---
 
-### Live Options Chain (WebSocket)
+### Strategy Save / Load
 
-**WS** `ws://localhost:8000/ws/options-chain/{symbol}` — streams a simulated options chain every 1.5s.
+**POST** `/api/strategy/save` — persists a named strategy with legs to PostgreSQL.
 
-Example symbols: `NIFTY` (spot ~24800), any other symbol defaults to spot ~51500.
-
-Payload per tick:
-```json
-{
-  "symbol": "NIFTY",
-  "spot": 24812.35,
-  "timestamp": "...",
-  "chain": [
-    {"strike": 24800, "call": {"ltp":..., "iv":..., "oi":..., "volume":...}, "put": {...}}
-  ]
-}
+```cmd
+curl -X POST http://localhost:8080/api/strategy/save ^
+  -H "Content-Type: application/json" ^
+  -d "{\"name\":\"My Iron Condor\",\"underlyingSymbol\":\"NIFTY\",\"legs\":[{\"optionType\":\"CALL\",\"action\":\"SELL\",\"strikePrice\":25000,\"expiryDate\":\"2026-07-31\",\"quantity\":1,\"premium\":45.0}]}"
 ```
 
-Separately, the **backend's own Kafka→Redis pipeline** simulates ticks independently:
-- `MarketDataProducer` publishes ~18 ticks per cycle to Kafka topic `market.ticks`.
-- `MarketDataConsumer` consumes them and flushes a chain snapshot into Redis under key `chain:NIFTY`.
+Response: `{"strategyId":"...","status":"SAVED"}`
 
-This is a second, independent live-data mechanism from the FastAPI WebSocket — useful to mention in a demo as a resilience/architecture story (decoupled ingestion vs. delivery).
+**GET** `/api/strategy/my-strategies` — lists all saved strategies for demo user.
+
+```cmd
+curl http://localhost:8080/api/strategy/my-strategies
+```
+
+---
+
+### Live Options Chain (Kafka → Redis)
+
+The backend continuously generates simulated option chain data:
+
+```cmd
+docker exec sb-redis redis-cli GET chain:NIFTY
+```
+
+Returns a JSON array of 18 option ticks (9 strikes × CALL + PUT), refreshed every ~3 seconds. Each tick includes: `symbol`, `strikePrice`, `optionType`, `ltp`, `openInterest`, `impliedVolatility`, `volume`.
+
+**WebSocket (FastAPI):** `ws://localhost:8000/ws/options-chain/{symbol}` — streams a formatted chain payload every 1.5s including spot price.
 
 ---
 
 ## Data Flow Diagrams
 
-### Payoff / Margin request flow
+### Kafka → Redis market data pipeline
+
+```mermaid
+sequenceDiagram
+    participant Mock as MockMarketDataProvider
+    participant Prod as MarketDataProducer (every 3s)
+    participant Kafka as Kafka (market.ticks)
+    participant Cons as MarketDataConsumer
+    participant Redis as Redis (chain:NIFTY, 30s TTL)
+    participant TS as TimescaleDB (market_tick hypertable)
+
+    loop every 3 seconds
+        Prod->>Mock: fetchChain("NIFTY")
+        Mock-->>Prod: 18 OptionTick objects (Black-Scholes priced)
+        Prod->>Kafka: publish 18 messages (key=symbol)
+        Kafka->>Cons: deliver batch
+        Cons->>Redis: flush chain snapshot when buffer >= 18
+        Cons->>TS: INSERT each tick row
+    end
+```
+
+### Request flow: recommend → payoff → save
 
 ```mermaid
 sequenceDiagram
     participant U as Client
     participant SB as Spring Boot (:8080)
-    participant ML as FastAPI ML Service (:8000)
+    participant ML as FastAPI (:8000)
+    participant DB as PostgreSQL
 
-    U->>SB: POST /api/strategy/payoff (legs, current_spot)
-    SB->>SB: Deserialize into PayoffRequestDto
-    SB->>ML: POST /api/payoff (snake_case JSON)
-    ML->>ML: numpy: compute payoff curve, breakevens, max P/L
-    ML-->>SB: JSON response (snake_case)
-    SB->>SB: Deserialize into PayoffResponseDto
-    SB-->>U: JSON response
-```
+    U->>SB: GET /api/strategy/recommend
+    SB->>DB: findTopByUserId (risk_profile table)
+    DB-->>SB: RiskProfile (MODERATE, score 28)
+    SB->>ML: POST /api/recommend {riskBand: MODERATE}
+    ML-->>SB: {strategy: Iron Condor, confidence: 0.75}
+    SB-->>U: RecommendationResponse
 
-### Kafka → Redis market data pipeline
+    U->>SB: POST /api/strategy/payoff (legs, spot)
+    SB->>ML: POST /api/payoff
+    ML-->>SB: {breakevens, max_profit, max_loss, payoff[]}
+    SB-->>U: PayoffResponse
 
-```mermaid
-sequenceDiagram
-    participant Sched as Scheduled Task
-    participant Prod as MarketDataProducer
-    participant Kafka as Kafka (market.ticks)
-    participant Cons as MarketDataConsumer
-    participant Redis as Redis (chain:NIFTY)
-
-    loop every ~3s
-        Sched->>Prod: trigger tick generation
-        Prod->>Kafka: publish 18 ticks
-        Kafka->>Cons: deliver batch
-        Cons->>Redis: flush chain snapshot
-    end
+    U->>SB: POST /api/strategy/save (name, legs)
+    SB->>DB: INSERT strategy + strategy_leg rows
+    SB-->>U: {strategyId, status: SAVED}
 ```
 
 ---
@@ -358,89 +400,87 @@ sequenceDiagram
 
 | Step | Feature | Status |
 |---|---|---|
-| 4 | Risk Profile API (weighted scoring, save/get) | ✅ Done |
-| 5 | ML service recommendation stub | ✅ Done |
-| 6 | Live options chain (WebSocket + Kafka/Redis pipeline) | ✅ Done |
-| 7 | Payoff diagram (breakeven, max P&L) | ✅ Done |
-| 8 | Margin estimator (defined/undefined risk detection) | ✅ Done |
-| 10 | Strategy save/load | ⏳ Not started |
-| — | Frontend quiz UI | ⏳ Not started (backend verified via curl) |
-| — | Paper trading hook | ⏳ Skipped for this milestone |
+| 1 | Project scaffold (Spring Boot + React + FastAPI + Docker Compose) | ✅ Done |
+| 2 | Database schema — 5 Flyway migrations, TimescaleDB hypertable, retention policy | ✅ Done |
+| 3 | Market data adapter — Kafka pipeline, Redis cache, MockMarketDataProvider (Black-Scholes) | ✅ Done |
+| 4 | Risk profile API — weighted scoring, save/get endpoints | ✅ Done |
+| 5 | ML service — FastAPI recommendation stub with real API contract | ✅ Done |
+| 6 | Live options chain — Kafka→Redis pipeline verified, WebSocket endpoint in ML service | ✅ Done |
+| 7 | Payoff diagram — multi-leg payoff curve, breakeven, max profit/loss | ✅ Done |
+| 8 | Margin estimator — defined/undefined risk detection, SPAN approximation | ✅ Done |
+| 9 | Strategy save/load — POST /api/strategy/save, GET /api/strategy/my-strategies | ✅ Done |
+
 
 ---
 
 ## Troubleshooting
 
-Issues actually hit while building this project, and their fixes — kept here so they don't get re-debugged from scratch next time.
+Real issues hit during this build, documented to avoid re-debugging.
+
+**`Connection to localhost:5432 refused`**
+Docker Desktop isn't running. Open Docker Desktop, wait for "Engine running" in the system tray (30-60s), then `docker compose up -d`.
 
 **`Port 8080 was already in use`**
-A previous Spring Boot instance is still running. Find and kill it:
+A previous Spring Boot instance is still running:
 ```cmd
 netstat -ano | findstr :8080
-taskkill /PID <pid_from_above> /F
+taskkill /PID <pid> /F
 ```
 
+**`illegal character: '\ufeff'` in Java compilation**
+BOM (Byte Order Mark) written by Windows PowerShell's `Set-Content`. Fix: always write Java and SQL files using `[IO.File]::WriteAllText` with `New-Object System.Text.UTF8Encoding $false` — this is the No-BOM UTF-8 encoder. Regular `Set-Content -Encoding UTF8` in PowerShell adds a BOM that the Java compiler rejects.
+
+**`422 Unprocessable Content` from FastAPI**
+Field name mismatch — FastAPI expects snake_case, Spring sends camelCase. Fix: use explicit `@JsonProperty("snake_case_name")` per field in DTOs. Class-level `@JsonNaming` is unreliable when multiple ObjectMapper beans exist.
+
 **`Could not resolve placeholder 'ml.service.url'`**
-`application.yml` isn't defining the property, or a duplicate `ml:` key is shadowing it. Give the `@Value` injection a fallback so the app doesn't hard-crash:
+Add fallback to `@Value` annotation:
 ```java
 @Value("${ml.service.url:http://localhost:8000}")
 ```
-Then fix the actual `application.yml` afterward.
 
-**`422 Unprocessable Content` from FastAPI, even though the Java DTO "looks right"**
-Class-level `@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)` can silently fail to apply (possibly overridden by another `ObjectMapper` bean elsewhere in the app). **Fix:** use explicit per-field `@JsonProperty("snake_case_name")` annotations instead of the class-level annotation — this is far more reliable and was the actual fix used in this project for `OptionLegDto`, `MarginRequestDto`, `PayoffRequestDto`, `MarginResponseDto`, and `PayoffResponseDto`.
-
-**Maven says `Nothing to compile - all classes are up to date` but your edit isn't reflected at runtime**
-Maven's incremental compiler occasionally misses a changed file. Force a full rebuild:
+**`NOT_LEADER_OR_FOLLOWER` from Kafka producer**
+Stale topic partition state after container restart. Delete the topic and let Spring recreate it:
 ```cmd
-mvn clean spring-boot:run
+docker exec sb-kafka /opt/kafka/bin/kafka-topics.sh --delete --topic market.ticks --bootstrap-server localhost:9092
+```
+Then restart the Spring Boot app — `KafkaConfig.NewTopic` bean recreates it on startup.
+
+**Flyway silent skip — no migration logs despite jars on classpath**
+Spring Boot 4.1 + Flyway 12 auto-configuration incompatibility. Fix: explicitly wire Flyway as a `@Bean(initMethod = "migrate")` in `StrategyBuilderBackendApplication` instead of relying on auto-config. See `FlywayConfig` inner class in `StrategyBuilderBackendApplication.java`.
+
+**Kafka binary not on PATH inside container**
+`kafka-topics.sh` not found when running `docker exec`. Use full path:
+```cmd
+docker exec sb-kafka /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
 ```
 
-**`No plugin found for prefix 'spring_boot'`**
-Typo — Maven goal is `spring-boot:run` (hyphen), not `spring_boot:run` (underscore).
-
-**FastAPI websocket crashes with `NameError: name 'datetime' is not defined`**
-`main.py` originally only imported `from datetime import date`, but the websocket handler calls `datetime.utcnow()`. Fix the import:
-```python
-from datetime import date, datetime
+**Out of memory crash during Maven build**
+Three Docker containers + Maven JVM exceeds available RAM. Set heap limit before running:
+```cmd
+set MAVEN_OPTS=-Xmx512m
 ```
 
-**Uvicorn not picking up `main.py` changes**
-Restart with `--reload`, or manually Ctrl+C and restart after every edit if not using `--reload`.
+---
 
-**Windows Command Prompt shows `'#' is not recognized as an internal or external command`**
-`#` is a shell-comment character in bash but not in `cmd.exe`. Harmless — just don't paste bash-style comment lines into `cmd`; use `::` or `rem` for comments in Windows batch context, or omit them entirely.
+## Known Limitations and Production Path
+
+| Limitation | Production fix |
+|---|---|
+| Mock market data (Black-Scholes random) | Replace `MockMarketDataProvider` with `NseDataProvider` — the adapter interface is already in place, zero consumer changes needed |
+| Margin is a heuristic approximation | Call existing broker RMS via internal API — same contract, real SPAN numbers |
+| Spring Security dev-mode (no real auth) | Wire JWT filter in `SecurityConfig`, add `app_user` table token column |
+| Single Kafka consumer, one partition | Scale to 3+ partitions per symbol, one consumer per partition horizontally |
+| TimescaleDB retention at 30 days | Already implemented in V5 migration — `add_retention_policy('market_tick', INTERVAL '30 days')` |
 
 ---
 
 ## Git Workflow
 
-Initial push to the shared repo:
 ```cmd
 cd C:\Users\Nainsukh\strategy-builder
-git remote -v                     # check if 'origin' already points somewhere
 git remote add origin https://github.com/Ananya-patel/Strategy_builder_moneylogix.git
-# or, if origin already exists and points elsewhere:
-git remote set-url origin https://github.com/Ananya-patel/Strategy_builder_moneylogix.git
-
-git branch                        # confirm branch name (main/master)
+git branch
 git push -u origin main
 ```
 
-Regular commits during development followed this pattern:
-```cmd
-git add .
-git commit -m "Step N: <what changed> - <why>"
-git push
-```
-
-> You need collaborator (write) access on the target repo for `git push` to succeed over HTTPS — otherwise fork the repo and open a pull request instead. GitHub requires a Personal Access Token (not your account password) for HTTPS pushes.
-
----
-
-## Known Limitations / Honest Caveats
-
-- Margin estimation is a **heuristic approximation**, not a real exchange SPAN calculation — accurate for demo/pitch purposes, not for live trading decisions.
-- Spring Security is currently disabled/dev-mode (`generated security password` shown in logs is unused since endpoints aren't actually protected) — **must** be properly configured before any production deployment.
-- The options chain data (both the FastAPI WebSocket and the Kafka/Redis pipeline) is **simulated/random**, not real market data.
-- No frontend UI is implemented yet — all endpoints are verified via `curl`/Postman.
