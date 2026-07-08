@@ -1,6 +1,10 @@
 import asyncio
 import random
-from datetime import datetime
+from datetime import date 
+import numpy as np
+from pydantic import BaseModel
+from typing import List
+
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from models.recommendation import (
@@ -93,3 +97,67 @@ async def options_chain_ws(websocket: WebSocket, symbol: str):
             await asyncio.sleep(1.5)
     except WebSocketDisconnect:
         print(f"Client disconnected from {symbol} feed")
+
+
+# ---------------- Step 7: Payoff Diagram ----------------
+
+class OptionLeg(BaseModel):
+    option_type: str   # "call" or "put"
+    position: str       # "buy" or "sell"
+    strike: float
+    premium: float
+    quantity: int = 1
+
+class PayoffRequest(BaseModel):
+    legs: List[OptionLeg]
+    spot_range_pct: float = 0.1  # +/-10% around current spot
+    current_spot: float
+    steps: int = 100
+
+
+def leg_payoff(leg: OptionLeg, spot_prices: np.ndarray) -> np.ndarray:
+    if leg.option_type == "call":
+        intrinsic = np.maximum(spot_prices - leg.strike, 0)
+    else:  # put
+        intrinsic = np.maximum(leg.strike - spot_prices, 0)
+
+    if leg.position == "buy":
+        payoff = (intrinsic - leg.premium) * leg.quantity
+    else:  # sell
+        payoff = (leg.premium - intrinsic) * leg.quantity
+
+    return payoff
+
+
+@app.post("/api/payoff")
+def calculate_payoff(req: PayoffRequest):
+    low = req.current_spot * (1 - req.spot_range_pct)
+    high = req.current_spot * (1 + req.spot_range_pct)
+    spot_prices = np.linspace(low, high, req.steps)
+
+    total_payoff = np.zeros(req.steps)
+    for leg in req.legs:
+        total_payoff += leg_payoff(leg, spot_prices)
+
+    # breakeven points: where payoff crosses zero
+    breakevens = []
+    for i in range(len(total_payoff) - 1):
+        if total_payoff[i] == 0:
+            breakevens.append(round(float(spot_prices[i]), 2))
+        elif total_payoff[i] * total_payoff[i + 1] < 0:  # sign change
+            # linear interpolation for the zero crossing
+            x0, x1 = spot_prices[i], spot_prices[i + 1]
+            y0, y1 = total_payoff[i], total_payoff[i + 1]
+            zero_x = x0 - y0 * (x1 - x0) / (y1 - y0)
+            breakevens.append(round(float(zero_x), 2))
+
+    max_profit = float(np.max(total_payoff))
+    max_loss = float(np.min(total_payoff))
+
+    return {
+        "spot_prices": [round(float(s), 2) for s in spot_prices],
+        "payoff": [round(float(p), 2) for p in total_payoff],
+        "breakevens": breakevens,
+        "max_profit": max_profit if max_profit < 1e6 else "unlimited",
+        "max_loss": max_loss if max_loss > -1e6 else "unlimited",
+    }        
