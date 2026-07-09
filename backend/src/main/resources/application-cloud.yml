@@ -14,8 +14,8 @@ spring:
       ddl-auto: validate
     open-in-view: false
   flyway:
-  custom:
     locations: classpath:db/migration-cloud
+    baseline-on-migrate: true
     baseline-version: "0"
 logging:
   level:
