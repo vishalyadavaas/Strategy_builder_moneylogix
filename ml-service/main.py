@@ -1,9 +1,11 @@
 import asyncio
+import math
 import random
 from datetime import date, datetime
 import numpy as np
+from scipy.stats import norm
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -16,7 +18,7 @@ app = FastAPI(title="Strategy Builder ML Service")
 STRATEGY_MAP = {
     RiskBand.CONSERVATIVE: Strategy(
         name="Covered Call",
-        description="Hold underlying + sell OTM call for income, capped upside.",
+        description="Hold underlying + sell OTM call for income,capped upside.",
         maxLoss=None,
         maxProfit=None,
     ),
@@ -107,6 +109,8 @@ class OptionLeg(BaseModel):
     strike: float
     premium: float
     quantity: int = 1
+    iv: Optional[float] = 0.15           # implied volatility, default 15%
+    days_to_expiry: Optional[int] = 7    # default 1 week out
 
 class PayoffRequest(BaseModel):
     legs: List[OptionLeg]
@@ -129,6 +133,41 @@ def leg_payoff(leg: OptionLeg, spot_prices: np.ndarray) -> np.ndarray:
     return payoff
 
 
+def calculate_greeks(spot: float, strike: float, option_type: str,
+                      days_to_expiry: int = 7, iv: float = 0.15, r: float = 0.06):
+    """Black-Scholes delta and theta for a single leg."""
+    T = max(days_to_expiry, 1) / 365
+    sigma = max(iv, 0.01)
+
+    d1 = (math.log(spot / strike) + (r + sigma**2 / 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+
+    if option_type == "call":
+        delta = norm.cdf(d1)
+        theta = (
+            -(spot * norm.pdf(d1) * sigma) / (2 * math.sqrt(T))
+            - r * strike * math.exp(-r * T) * norm.cdf(d2)
+        ) / 365
+    else:  # put
+        delta = norm.cdf(d1) - 1
+        theta = (
+            -(spot * norm.pdf(d1) * sigma) / (2 * math.sqrt(T))
+            + r * strike * math.exp(-r * T) * norm.cdf(-d2)
+        ) / 365
+
+    return {"delta": round(float(delta), 4), "theta": round(float(theta), 4)}
+
+
+def leg_greeks_signed(leg: OptionLeg, spot: float):
+    """Greeks for a leg, sign-adjusted for buy (+1) vs sell (-1) and quantity."""
+    raw = calculate_greeks(spot, leg.strike, leg.option_type, leg.days_to_expiry, leg.iv)
+    direction = 1 if leg.position == "buy" else -1
+    return {
+        "delta": round(raw["delta"] * direction * leg.quantity, 4),
+        "theta": round(raw["theta"] * direction * leg.quantity, 4),
+    }
+
+
 @app.post("/api/payoff")
 def calculate_payoff(req: PayoffRequest):
     low = req.current_spot * (1 - req.spot_range_pct)
@@ -145,7 +184,6 @@ def calculate_payoff(req: PayoffRequest):
         if total_payoff[i] == 0:
             breakevens.append(round(float(spot_prices[i]), 2))
         elif total_payoff[i] * total_payoff[i + 1] < 0:  # sign change
-            # linear interpolation for the zero crossing
             x0, x1 = spot_prices[i], spot_prices[i + 1]
             y0, y1 = total_payoff[i], total_payoff[i + 1]
             zero_x = x0 - y0 * (x1 - x0) / (y1 - y0)
@@ -154,13 +192,32 @@ def calculate_payoff(req: PayoffRequest):
     max_profit = float(np.max(total_payoff))
     max_loss = float(np.min(total_payoff))
 
+    # Greeks: per-leg (signed for buy/sell + quantity) and net totals
+    leg_greeks = []
+    net_delta = 0.0
+    net_theta = 0.0
+    for leg in req.legs:
+        g = leg_greeks_signed(leg, req.current_spot)
+        leg_greeks.append({
+            "strike": leg.strike,
+            "option_type": leg.option_type,
+            "position": leg.position,
+            "delta": g["delta"],
+            "theta": g["theta"],
+        })
+        net_delta += g["delta"]
+        net_theta += g["theta"]
+
     return {
         "spot_prices": [round(float(s), 2) for s in spot_prices],
         "payoff": [round(float(p), 2) for p in total_payoff],
         "breakevens": breakevens,
         "max_profit": max_profit if max_profit < 1e6 else "unlimited",
         "max_loss": max_loss if max_loss > -1e6 else "unlimited",
-    } 
+        "leg_greeks": leg_greeks,
+        "net_delta": round(net_delta, 4),
+        "net_theta": round(net_theta, 4),
+    }
 
 # ---------------- Step 8: Margin Estimator ----------------
 
@@ -171,7 +228,6 @@ class MarginRequest(BaseModel):
 
 @app.post("/api/margin")
 def calculate_margin(req: MarginRequest):
-    # Use a wide spot range to reliably detect unbounded risk at the tails
     spot_range_pct = 0.5
     steps = 200
     low = req.current_spot * (1 - spot_range_pct)
@@ -184,7 +240,6 @@ def calculate_margin(req: MarginRequest):
 
     max_loss = float(np.min(total_payoff))
 
-    # If payoff is still worsening at either boundary, risk is unbounded
     slope_low = total_payoff[1] - total_payoff[0]
     slope_high = total_payoff[-1] - total_payoff[-2]
     is_defined_risk = not (slope_low > 0 or slope_high < 0)
@@ -208,4 +263,4 @@ def calculate_margin(req: MarginRequest):
         "method": method,
         "is_defined_risk": is_defined_risk,
         "max_loss": max_loss if is_defined_risk else "unlimited",
-    }       
+    }
